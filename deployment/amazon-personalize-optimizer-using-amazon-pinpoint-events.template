@@ -1,0 +1,1502 @@
+# Amazon Personalize Optimizer Using Amazon Pinpoint Events Solution
+#
+# template for amazon-personalize-optimizer-using-amazon-pinpoint-events
+# **DO NOT DELETE**
+#
+# author: rjlowe@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: (SO0095) - Amazon Personalize Optimizer Using Amazon Pinpoint Events
+
+Parameters:
+  EventTypes:
+    Description: "Select which Amazon Pinpoints you wish to submit to Amazon Personalize for Interaction retraining.  Full list of Pinpoint events can be found here: https://docs.aws.amazon.com/pinpoint/latest/developerguide/event-streams.html"
+    Default: "_campaign.opened_notification, _email.open, _email.click, _email.unsubscribe"
+    Type: CommaDelimitedList
+  EventValues:
+    Description: List of Event Values that match to the List of Events used to submit to Amazon Personalize for Interaction retraining
+    Default: 100, 50, 100, -200
+    Type: List<Number>
+  PersonalizeCampaignArn:
+    Description: Amazon Personalize Campaign ARN to use
+    Type: String
+  PersonalizeSolutionArn:
+    Description: Amazon Personalize Solution ARN used in the Personalize Campaign
+    Type: String
+  PersonalizeInteractionDatasetArn:
+    Description: Amazon Personalize Interaction Dataset ARN
+    Type: String
+  PinpointProjectId:
+    Description: Amazon Pinpoint Project ID to use
+    Type: String
+  InteractionsQueryDateScope:
+    Description: How many days should we query to find interactions, for all time use -1
+    Default: -1
+    Type: Number
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Personalize Configuration"
+        Parameters:
+          - PersonalizeCampaignArn
+          - PersonalizeSolutionArn
+          - PersonalizeInteractionDatasetArn
+      -
+        Label:
+          default: "Pinpoint and Event Configuration"
+        Parameters:
+          - PinpointProjectId
+          # - EndpointOrUser
+          - EventTypes
+          - EventValues
+          - InteractionsQueryDateScope
+    ParameterLabels:
+      PinpointProjectId:
+        default: Pinpoint Project ID
+      EventTypes:
+        default: Pinpoint Event Types
+      EventValues:
+        default: Pinpoint Event Type Interaction Values
+      PersonalizeCampaignArn:
+        default: Amazon Personalize Campaign ARN
+      PersonalizeSolutionArn:
+        default: Amazon Personalize Solution ARN
+      PersonalizeInteractionDatasetArn:
+        default: Amazon Personalize Interaction Dataset ARN
+      InteractionsQueryDateScope:
+        default: Interaction History Date Scope
+
+Mappings:
+  MetricsMap:
+    Send-Data:
+      SendAnonymousData: "Yes"
+
+  SourceCode:
+    General:
+      S3Bucket: "%%BUCKET_NAME%%"
+      KeyPrefix: "%%SOLUTION_NAME%%/%%VERSION%%"
+
+
+Conditions:
+  NeedsPersonalizeCampaignArn: !Equals
+      - ''
+      - !Ref PersonalizeCampaignArn
+
+Resources:
+
+  ### Buckets
+  DataS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: Not public facing.
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogBucket
+        LogFilePrefix: optimize-personalize-campaigns-data/
+
+  DataS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataS3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service: "personalize.amazonaws.com"
+            Action:
+              - "s3:GetObject"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataS3Bucket}"
+              - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+
+  LogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: This is the log bucket.
+    Properties:
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: AWSCloudTrailAclCheck
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: "s3:GetBucketAcl"
+          Resource: !Sub arn:aws:s3:::${LogBucket}
+        - Sid: AWSCloudTrailWrite
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: "s3:PutObject"
+          Resource: !Sub arn:aws:s3:::${LogBucket}/AWSLogs/${AWS::AccountId}/*
+          Condition:
+            StringEquals:
+              "s3:x-amz-acl": "bucket-owner-full-control"
+
+  ### Event Stream
+  PinpointEventStream:
+    Type: AWS::Pinpoint::EventStream
+    Properties:
+      ApplicationId: !Ref PinpointProjectId
+      DestinationStreamArn: !GetAtt PinpointEventFirehose.Arn
+      RoleArn: !GetAtt PinpointKinesisStreamRole.Arn
+
+  PinpointEventFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: "DirectPut"
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub "arn:aws:s3:::${DataS3Bucket}"
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: "UNCOMPRESSED"
+        Prefix: "events/"
+        RoleARN: !GetAtt PinpointKinesisFirehoseRole.Arn
+        ProcessingConfiguration:
+          Enabled: TRUE
+          Processors:
+            -
+              Parameters:
+                -
+                  ParameterName: "LambdaArn"
+                  ParameterValue: !GetAtt FirehoseRecordConversionLambda.Arn
+                -
+                  ParameterName: "BufferIntervalInSeconds"
+                  ParameterValue: 60
+                -
+                  ParameterName: "BufferSizeInMBs"
+                  ParameterValue: 3
+                -
+                  ParameterName: "NumberOfRetries"
+                  ParameterValue: 3
+                -
+                  ParameterName: "RoleArn"
+                  ParameterValue: !GetAtt PinpointKinesisFirehoseRole.Arn
+              Type: "Lambda"
+
+  FirehoseRecordConversionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+        Handler: index.handler
+        Role: !GetAtt FirehoseRecordConversionLambdaRole.Arn
+        Runtime: "nodejs12.x"
+        Timeout: 60
+        Code:
+          S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+          S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "firehose-record-conversion-lambda.zip"]]
+
+
+
+  PinpointKinesisStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pinpoint.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "firehose:PutRecordBatch"
+                  - "firehose:DescribeDeliveryStream"
+                Resource: !GetAtt PinpointEventFirehose.Arn
+
+  PinpointKinesisFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}*"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+              -
+                Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                  - "lambda:GetFunctionConfiguration"
+                Resource: !GetAtt FirehoseRecordConversionLambda.Arn
+              -
+                Effect: "Allow"
+                Action: "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:log-stream:*"
+
+  FirehoseRecordConversionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  ### Glue
+  PinpointEventDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${AWS::StackName}-pinpoint-events"
+        Description: "Pinpoint Streaming Event Database"
+
+  ### State Machine & Lambdas
+
+  CleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataS3Bucket
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "01-cleanup-lambda.zip"]]
+
+  ExportPinpointEndpointsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt ExportPinpointEndpointsLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          PINPOINT_APPLICATION_ID: !Ref PinpointProjectId
+          S3_BUCKET: !Ref DataS3Bucket
+          ROLE_ARN: !GetAtt PinpointExportRole.Arn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "02-export-pinpoint-endpoints-lambda.zip"]]
+
+
+  ExportStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt ExportStatusLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          PINPOINT_APPLICATION_ID: !Ref PinpointProjectId
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "03-export-status-lambda.zip"]]
+
+  QueryAugmentStartLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt QueryAugmentStartLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataS3Bucket
+          NAMED_QUERY: !Ref RetrieveInteractionsNamedQuery
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "04-query-augment-start-lambda.zip"]]
+
+
+  QueryStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt QueryStatusLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "05-query-status-lambda.zip"]]
+
+  DataSetImportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DataSetImportLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          IMPORT_ROLE: !GetAtt PersonalizeDatasetImportRole.Arn
+          DATA_SET_ARN: !Ref PersonalizeInteractionDatasetArn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "06-dataset-import-lambda.zip"]]
+
+  DataSetImportStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DataSetImportStatusLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "07-dataset-import-status-lambda.zip"]]
+
+  CreateSolutionVersionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CreateSolutionVersionLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          SOLUTION_ARN: !Ref PersonalizeSolutionArn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "08-create-solution-version-lambda.zip"]]
+
+  CreateSolutionVersionStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CreateSolutionVersionStatusLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "09-create-solution-version-status-lambda.zip"]]
+
+  UpdateCampaignLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UpdateCampaignLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          MIN_PROVISIONED_TPS: 1
+          CAMPAIGN_ARN: !Ref PersonalizeCampaignArn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "10-update-campaign-lambda.zip"]]
+
+  UpdateCampaignStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UpdateCampaignStatusLambdaRole.Arn
+      Runtime: "nodejs12.x"
+      Timeout: 60
+      Environment:
+        Variables:
+          CAMPAIGN_ARN: !Ref PersonalizeCampaignArn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "11-update-campaign-status-lambda.zip"]]
+
+  DailyRetrainingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: CustomResourceHelper
+    Properties:
+      RoleArn: !GetAtt DailyRetrainingStateMachineRole.Arn
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "StartAt": "CleanStart",
+              "States": {
+                "CleanStart": {
+                  "Type": "Task",
+                  "Resource": "${CleanupArn}",
+                  "Next": "ExportPinpointEndpoints"
+                },
+                "ExportPinpointEndpoints": {
+                  "Type": "Task",
+                  "Resource": "${ExportPinpointEndpointsArn}",
+                  "Next": "ExportWait"
+                },
+                "ExportWait": {
+                  "Type": "Wait",
+                  "Seconds": 30,
+                  "Next": "ExportStatus"
+                },
+                "ExportStatus": {
+                  "Type": "Task",
+                  "Resource": "${ExportStatusArn}",
+                  "Next": "IsExportFinished"
+                },
+                "IsExportFinished": {
+                  "Type": "Choice",
+                  "Default": "ExportWait",
+                  "Choices": [
+                    {
+                      "Variable": "$.ExportJobStatus",
+                      "StringEquals": "FAILED",
+                      "Next": "ExportFailed"
+                    },
+                    {
+                      "Variable": "$.ExportJobStatus",
+                      "StringEquals": "COMPLETED",
+                      "Next": "QueryAugmentStart"
+                    }
+                  ]
+                },
+                "ExportFailed": {
+                  "Type": "Fail",
+                  "Cause": "Pinpoint Export failed",
+                  "Error": "Pinpoint Export failed"
+                },
+                "QueryAugmentStart": {
+                  "Type": "Task",
+                  "Resource": "${QueryAugmentStartArn}",
+                  "Next": "QueryWait"
+                },
+                "QueryWait" : {
+                  "Type": "Wait",
+                  "Seconds": 5,
+                  "Next": "QueryStatus"
+                },
+                "QueryStatus": {
+                  "Type": "Task",
+                  "Resource": "${QueryStatusArn}",
+                  "Next": "IsQueryFinished"
+                },
+                "IsQueryFinished":{
+                  "Type": "Choice",
+                  "Default": "QueryWait",
+                  "Choices": [{
+                      "Variable": "$.Status",
+                      "StringEquals": "FAILED",
+                      "Next": "QueryFailed"
+                  },{
+                      "Variable": "$.Status",
+                      "StringEquals": "SUCCEEDED",
+                      "Next": "InteractionDatasetImport"
+                  }]
+                },
+                "QueryFailed": {
+                  "Type": "Fail",
+                  "Cause": "Athena Query failed",
+                  "Error": "Athena Query failed"
+                },
+                "InteractionDatasetImport": {
+                  "Type": "Task",
+                  "Resource": "${DataSetImportLambdaArn}",
+                  "Next": "InteractionImportWait"
+                },
+                "InteractionImportWait": {
+                  "Type": "Wait",
+                  "Seconds": 150,
+                  "Next": "InteractionImportStatus"
+                },
+                "InteractionImportStatus": {
+                  "Type": "Task",
+                  "Resource": "${DataSetImportStatusLambdaArn}",
+                  "Next": "IsInteractionImportFinished"
+                },
+                "IsInteractionImportFinished": {
+                  "Type": "Choice",
+                  "Default": "InteractionImportWait",
+                  "Choices": [
+                    {
+                      "Variable": "$.DatasetImportJobStatus",
+                      "StringEquals": "CREATE FAILED",
+                      "Next": "InteractionImportFailed"
+                    },
+                    {
+                      "Variable": "$.DatasetImportJobStatus",
+                      "StringEquals": "ACTIVE",
+                      "Next": "CreateSolutionVersion"
+                    }
+                  ]
+                },
+                "InteractionImportFailed": {
+                  "Type": "Fail",
+                  "Cause": "Interaction Dataset Import failed",
+                  "Error": "Interaction Dataset Import failed"
+                },
+
+                "CreateSolutionVersion": {
+                  "Type": "Task",
+                  "Resource": "${CreateSolutionVersionLambdaArn}",
+                  "Next": "SolutionVersionWait"
+                },
+                "SolutionVersionWait": {
+                  "Type": "Wait",
+                  "Seconds": 200,
+                  "Next": "SolutionVersionStatus"
+                },
+                "SolutionVersionStatus": {
+                  "Type": "Task",
+                  "Resource": "${CreateSolutionVersionStatusLambdaArn}",
+                  "Next": "IsSolutionVersionFinished"
+                },
+                "IsSolutionVersionFinished": {
+                  "Type": "Choice",
+                  "Default": "SolutionVersionWait",
+                  "Choices": [
+                    {
+                      "Variable": "$.SolutionVersionStatus",
+                      "StringEquals": "CREATE FAILED",
+                      "Next": "SolutionVersionFailed"
+                    },
+                    {
+                      "Variable": "$.SolutionVersionStatus",
+                      "StringEquals": "ACTIVE",
+                      "Next": "SolutionCampaign"
+                    }
+                  ]
+                },
+                "SolutionVersionFailed": {
+                  "Type": "Fail",
+                  "Cause": "Solution Version failed",
+                  "Error": "Solution Version failed"
+                },
+
+
+                "SolutionCampaign": {
+                  "Type": "Task",
+                  "Resource": "${UpdateCampaignLambdaArn}",
+                  "Next": "CampaignWait"
+                },
+                "CampaignWait": {
+                  "Type": "Wait",
+                  "Seconds": 150,
+                  "Next": "CampaignStatus"
+                },
+                "CampaignStatus": {
+                  "Type": "Task",
+                  "Resource": "${UpdateCampaignStatusLambdaArn}",
+                  "Next": "IsCampaignFinished"
+                },
+                "IsCampaignFinished": {
+                  "Type": "Choice",
+                  "Default": "CampaignWait",
+                  "Choices": [
+                    {
+                      "Variable": "$.CampaignStatus",
+                      "StringEquals": "CREATE FAILED",
+                      "Next": "CampaignFailed"
+                    },
+                    {
+                      "Variable": "$.CampaignStatus",
+                      "StringEquals": "ACTIVE",
+                      "Next": "CampaignEnd"
+                    }
+                  ]
+                },
+                "CampaignFailed": {
+                  "Type": "Fail",
+                  "Cause": "Campaign failed",
+                  "Error": "Campaign failed"
+                },
+                "CampaignEnd": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            }
+          - {CleanupArn: !GetAtt CleanupLambda.Arn, ExportPinpointEndpointsArn: !GetAtt ExportPinpointEndpointsLambda.Arn, ExportStatusArn: !GetAtt ExportStatusLambda.Arn, QueryAugmentStartArn: !GetAtt QueryAugmentStartLambda.Arn, QueryStatusArn: !GetAtt QueryStatusLambda.Arn, DataSetImportLambdaArn: !GetAtt DataSetImportLambda.Arn, DataSetImportStatusLambdaArn: !GetAtt DataSetImportStatusLambda.Arn, CreateSolutionVersionLambdaArn: !GetAtt CreateSolutionVersionLambda.Arn, CreateSolutionVersionStatusLambdaArn: !GetAtt CreateSolutionVersionStatusLambda.Arn, UpdateCampaignLambdaArn: !GetAtt UpdateCampaignLambda.Arn, UpdateCampaignStatusLambdaArn: !GetAtt UpdateCampaignStatusLambda.Arn}
+
+  DailyRetrainintCloudWatchEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Run the DailyRetrainingStateMachine Daily"
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      State: "ENABLED"
+      RoleArn: !GetAtt DailyRetrainintCloudWatchEventRole.Arn
+      Targets:
+        -
+          Arn: !Ref DailyRetrainingStateMachine
+          Id: "DailyRetrainingStateMachine"
+          RoleArn: !GetAtt DailyRetrainintCloudWatchEventRole.Arn
+
+  DailyRetrainintCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "states:StartExecution"
+                Resource: !Ref DailyRetrainingStateMachine
+
+  DailyRetrainingStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt CleanupLambda.Arn
+                  - !GetAtt ExportPinpointEndpointsLambda.Arn
+                  - !GetAtt ExportStatusLambda.Arn
+                  - !GetAtt QueryAugmentStartLambda.Arn
+                  - !GetAtt QueryStatusLambda.Arn
+                  - !GetAtt DataSetImportLambda.Arn
+                  - !GetAtt DataSetImportStatusLambda.Arn
+                  - !GetAtt CreateSolutionVersionLambda.Arn
+                  - !GetAtt CreateSolutionVersionStatusLambda.Arn
+                  - !GetAtt UpdateCampaignLambda.Arn
+                  - !GetAtt UpdateCampaignStatusLambda.Arn
+
+  CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+
+  ExportPinpointEndpointsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action: "iam:PassRole"
+                Resource:
+                  - !GetAtt PinpointExportRole.Arn
+              -
+                Effect: "Allow"
+                Action:
+                  - "mobiletargeting:CreateExportJob"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}/jobs/export"
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}"
+
+  PinpointExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pinpoint.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObjectAcl"
+                  - "s3:GetObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:GetObjectTagging"
+                  - "s3:DeleteObject"
+                  - "s3:GetObjectVersion"
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}*"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:ListAllMyBuckets"
+                  - "s3:GetBucketLocation"
+                Resource:
+                  - !Sub "arn:aws:s3:::*"
+
+  ExportStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "mobiletargeting:GetExportJob"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}/jobs/export/*"
+
+  QueryAugmentStartLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:CreateBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+              -
+                Effect: "Allow"
+                Action:
+                  - "athena:StartQueryExecution"
+                  - "athena:GetNamedQuery"
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetDatabases"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:GetPartition"
+                  - "glue:GetPartitions"
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${PinpointEventDatabase}/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${PinpointEventDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+
+  QueryStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "athena:GetQueryExecution"
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+
+  DataSetImportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:CreateDatasetImportJob"
+                Resource:
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset-group/*"
+              -
+                Effect: "Allow"
+                Action: "iam:PassRole"
+                Resource:
+                  - !GetAtt PersonalizeDatasetImportRole.Arn
+
+  DataSetImportStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:DescribeDatasetImportJob"
+                Resource: !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset-import-job/*"
+
+  CreateSolutionVersionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:CreateSolutionVersion"
+                Resource: !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution/*"
+
+  CreateSolutionVersionStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:DescribeSolutionVersion"
+                Resource:
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution-version/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution/*"
+
+  UpdateCampaignLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:UpdateCampaign"
+                Resource:
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution-version/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:campaign/*"
+
+  UpdateCampaignStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "personalize:DescribeCampaign"
+                Resource:
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution-version/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:solution/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:campaign/*"
+
+
+  PersonalizeDatasetImportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - personalize.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+
+
+  ### Athena Named Queries
+
+  RetrieveInteractionsNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Ref PinpointEventDatabase
+      Description: "Query to select events from recommendations for Amazon Personalize."
+      QueryString:
+        !Sub
+          |
+            WITH evs AS (
+              SELECT
+                client.client_id as endpoint_id,
+                attributes.campaign_id as campaign_id,
+                event_type,
+                arrival_timestamp
+              FROM event
+              WHERE
+                (
+                  ${InteractionsQueryDateScope} > 0
+                  AND arrival_timestamp >= date_add('day', -1, CURRENT_DATE)
+                  AND arrival_timestamp < CURRENT_DATE
+                ) OR (
+                  ${InteractionsQueryDateScope} = -1
+                )
+                AND
+                event_type != '_custom.recommender'
+            ),
+            recs AS (
+              SELECT
+                attributes.personalize_user_id as personalize_user_id,
+                client.client_id as endpoint_id,
+                attributes.campaign_id as campaign_id,
+                attributes.item_id as item_id,
+                event_type,
+                arrival_timestamp
+              FROM event
+              WHERE
+                (
+                  ${InteractionsQueryDateScope} > 0
+                  AND arrival_timestamp >= date_add('day', -1, CURRENT_DATE)
+                  AND arrival_timestamp < CURRENT_DATE
+                ) OR (
+                  ${InteractionsQueryDateScope} = -1
+                )
+                AND
+                event_type = '_custom.recommender'
+            )
+            SELECT
+              r.personalize_user_id as USER_ID,
+              r.item_id AS ITEM_ID,
+              b.event_type AS EVENT_TYPE,
+              v.EVENT_VALUE,
+              CAST(to_unixtime(b.arrival_timestamp) AS BIGINT) AS TIMESTAMP
+            FROM endpoint_export a
+            INNER JOIN recs r
+              ON a.id = r.endpoint_id
+            INNER JOIN evs b
+              ON a.id = b.endpoint_id AND r.campaign_id = b.campaign_id
+            INNER JOIN event_value v
+              ON b.event_type = v.event_type
+
+
+
+  AthenaCreateTableEventsNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Ref PinpointEventDatabase
+      Description: "Create the events table from S3."
+      QueryString:
+        !Sub
+          |
+            CREATE EXTERNAL TABLE IF NOT EXISTS `${PinpointEventDatabase}`.event (
+              client struct<client_id:string>,
+              attributes struct<campaign_id:string, item_id:string, personalize_user_id:string>,
+              event_type string,
+              arrival_timestamp timestamp
+            )
+            ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+            WITH SERDEPROPERTIES (
+              'serialization.format' = '1'
+            ) LOCATION 's3://${DataS3Bucket}/events/'
+            TBLPROPERTIES ('has_encrypted_data'='false');
+
+  AthenaCreateTableEndpointExportsNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Ref PinpointEventDatabase
+      Description: "Create the Endpoint Exports table from S3."
+      QueryString:
+        !Sub
+          |
+            CREATE EXTERNAL TABLE IF NOT EXISTS `${PinpointEventDatabase}`.endpoint_export (
+              id string,
+              channeltype string,
+              address string,
+              endpointstatus string,
+              optout string,
+              effectivedate string
+            )
+            ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+            WITH SERDEPROPERTIES (
+              'serialization.format' = '1'
+            ) LOCATION 's3://${DataS3Bucket}/endpoint_exports/'
+            TBLPROPERTIES ('has_encrypted_data'='false');
+
+  AthenaCreateTableEventValueNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Ref PinpointEventDatabase
+      Description: "Create the Event Values table from S3."
+      QueryString:
+        !Sub
+          |
+            CREATE EXTERNAL TABLE IF NOT EXISTS `${PinpointEventDatabase}`.event_value (
+              event_type string,
+              event_value double
+            )
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+            WITH SERDEPROPERTIES (
+              'serialization.format' = ',',
+              'field.delim' = ','
+            ) LOCATION 's3://${DataS3Bucket}/event_values/'
+            TBLPROPERTIES ('has_encrypted_data'='false', 'skip.header.line.count'='1');
+
+
+
+
+
+  ### Deployment Helper
+  SetupQueries:
+    Type: Custom::LoadLambda
+    Properties:
+      ServiceToken: !GetAtt CustomResourceHelper.Arn
+      CustomResourceAction: SetupQueries
+
+  CustomResourceHelper:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - PinpointEventDatabase
+      - AthenaCreateTableEventsNamedQuery
+      - AthenaCreateTableEndpointExportsNamedQuery
+      - AthenaCreateTableEventValueNamedQuery
+    Properties:
+      Environment:
+        Variables:
+          SOLUTION_BUCKET: !Join
+            - "-"
+            - - !FindInMap ["SourceCode", "General", "S3Bucket"]
+              - !Ref AWS::Region
+          SOLUTION_S3KEYPREFIX: !FindInMap ["SourceCode", "General", "KeyPrefix"]
+          S3_DATA_BUCKET: !Ref DataS3Bucket
+          EVENT_TYPES: !Join [ ",", !Ref EventTypes]
+          EVENT_VALUES: !Join [ ",", !Ref EventValues]
+          EVENT_NAMED_QUERY: !Ref AthenaCreateTableEventsNamedQuery
+          EXPORT_NAMED_QUERY: !Ref AthenaCreateTableEndpointExportsNamedQuery
+          VALUE_NAMED_QUERY: !Ref AthenaCreateTableEventValueNamedQuery
+      Description: Helps set up the Optimize Amazon Personalize Campaigns using Amazon Pinpoint Events solution.
+      Handler: index.handler
+      MemorySize: 256
+      Role: !GetAtt CustomResourceHelperRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 300
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region" ]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "custom-resource-helper.zip"]]
+
+
+  CustomResourceHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !FindInMap ["SourceCode", "General", "S3Bucket"]
+                      - "-"
+                      - !Ref AWS::Region
+                  - !Join
+                    - ""
+                    - - "arn:aws:s3:::"
+                      - !FindInMap ["SourceCode", "General", "S3Bucket"]
+                      - "-"
+                      - !Ref AWS::Region
+                      - "/*"
+              -
+                Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:CreateBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}"
+                  - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutDestination
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "athena:StartQueryExecution"
+                  - "athena:GetNamedQuery"
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetDatabases"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:GetPartition"
+                  - "glue:GetPartitions"
+                  - "glue:CreateTable"
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${PinpointEventDatabase}/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${PinpointEventDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+
+Outputs:
+  DataS3BucketName:
+    Description: S3 Bucket Name where the scoring model, events, and export data are stored
+    Value: !Ref DataS3Bucket
+  PathToScoringModel:
+    Description: Path to the Scoring Model CSV file
+    Value: !Sub "s3://${DataS3Bucket}/event_values/values.csv"
