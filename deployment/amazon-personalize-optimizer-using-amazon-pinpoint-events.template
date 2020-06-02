@@ -6,7 +6,7 @@
 # author: rjlowe@
 AWSTemplateFormatVersion: 2010-09-09
 
-Description: (SO0095) - Amazon Personalize Optimizer Using Amazon Pinpoint Events
+Description: (SO0095) - Amazon Personalize Optimizer Using Amazon Pinpoint Events - %%VERSION%%
 
 Parameters:
   EventTypes:
@@ -118,7 +118,7 @@ Resources:
       PolicyDocument:
         Version: 2012-10-17
         Statement:
-          -
+          - Sid: AllowPersonalizeAccess
             Effect: "Allow"
             Principal:
               Service: "personalize.amazonaws.com"
@@ -128,6 +128,16 @@ Resources:
             Resource:
               - !Sub "arn:aws:s3:::${DataS3Bucket}"
               - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataS3Bucket}/*"
+              - !Sub "arn:aws:s3:::${DataS3Bucket}"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
 
   LogBucket:
     Type: AWS::S3::Bucket
@@ -727,6 +737,11 @@ Resources:
 
   DailyRetrainingStateMachineRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W76
+            reason: Suppressing SPCM for IAM policy document
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1037,6 +1052,7 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset/*"
                   - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset-group/*"
+                  - !Sub "arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:dataset-import-job/*"
               -
                 Effect: "Allow"
                 Action: "iam:PassRole"
